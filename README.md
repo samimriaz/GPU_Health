@@ -10,8 +10,8 @@ The service compares pre-update and post-update evidence, checks absolute safety
 
 **Recommended design:**
 
-- Keep the HSDU/HealthStore client on each bare-metal host for direct GPU, driver, runtime, network, and storage visibility.
-- Send observations and urgent events to an independent, off-node HealthStore ingestion and decision service. Do not rely on the updated node to approve its own rollout.
+- Keep a lightweight health client on each bare-metal host for direct GPU, driver, runtime, network, and storage visibility.
+- Send observations and urgent events to an independent, off-node health evaluation service. Do not rely on the updated node to approve its own rollout.
 - Add BMC and optional SoC/DPU observations as independent sources, not replacements for host telemetry.
 - Stop on a single confirmed critical fault. For softer symptoms, require sustained regression plus corroboration, or a strong independently repeated end-to-end regression.
 - Treat missing telemetry as `UNKNOWN`, never healthy. Hold promotion when required evidence is missing.
@@ -23,7 +23,7 @@ This README is a proposed design, not an implemented service. Numeric thresholds
 ### Assumptions and terminology
 
 - The initial target is Linux bare-metal NVIDIA GPU infrastructure, using Kubernetes or a comparable scheduler. Adapt the collectors and vendor-specific policies for AMD or other accelerators.
-- "HSDU" means the existing node-side HealthStore client described in the request. Its expansion, APIs, privileges, and current delivery guarantees are not assumed.
+- "Health client" and "health evaluation service" are generic architectural roles, not specific products. Existing client APIs, privileges, and delivery guarantees must be verified before integration.
 - "SoC" is assumed to mean an independently running management processor or SmartNIC/DPU, such as a BlueField Arm subsystem, **not a security operations center**. Confirm this meaning before implementation.
 - BMC is a management controller with firmware and out-of-band interfaces, not simply another host process.
 - Host agent, NMAgent, and "NICE agent" are treated as examples from your environment. There is no assumed one-to-one mapping to a universal bare-metal GPU agent inventory.
@@ -284,48 +284,112 @@ Most importantly, a driver can report healthy and a Kubernetes node can report `
 
 ## 9. Architecture and near-real-time signal flow
 
-```text
- GPU / driver / runtime       NIC / RDMA       Storage / workload
-          |                       |                   |
-          +----------- host collectors --------------+
-                                  |
-                      local observation adapter
-                                  |
-                    HSDU host client / local gate
-                     | durable spool | heartbeat
-                     |               |
-                     +---- authenticated push -----------+
-                                                         |
- BMC -- management collector -- independent push -------->|
- SoC/DPU collector -- independent push (if present) ----->|
- Fabric/switch controller -- topology-scoped push ------->|
-                                                         v
-                                               ingestion gateway
-                                                         |
-                                             durable partitioned stream
-                                                 /               \
-                                      HealthStore history     online evaluator
-                                      and baseline queries       |
-                                                                 v
- Deployment events + manifests ------------------------> rollout gate
-                                                                 |
-                                               durable HOLD/HALT/CONTINUE
-                                                                 |
-                                                  deployment orchestrator
-                                                    fence + acknowledge
+### Recommended architecture
+
+Use an **event-driven push path for urgent faults**, a **short-interval metrics path for trends**, and a **separate control path for rollout decisions**. Do not make a CSV scan or a historical database query the critical delivery mechanism.
+
+The following diagram renders on GitHub:
+
+```mermaid
+flowchart TB
+    subgraph Host["Each bare-metal GPU host"]
+        GPU["GPU and driver events"]
+        Metrics["GPU, NIC, storage and workload metrics"]
+        Legacy["Existing agent CSV snapshots"]
+        Adapter["CSV compatibility adapter"]
+        Client["Health client: normalize, timestamp and sequence"]
+        Spool["Durable local spool with priority queues"]
+        GPU -->|"Immediate event capture"| Client
+        Metrics -->|"Sample every 5 seconds"| Client
+        Legacy --> Adapter --> Client
+        Client --> Spool
+    end
+
+    OOB["Independent BMC, optional DPU and fabric collectors"]
+
+    subgraph Service["Off-node health evaluation service"]
+        Gateway["Authenticated ingestion gateway"]
+        Events["Durable critical-event stream"]
+        Samples["Durable metrics and heartbeat stream"]
+        Hard["Immediate hard-fault and freshness evaluator"]
+        Window["Windowed regression evaluator"]
+        History["Historical evidence and baseline store"]
+        Gate["Durable rollout gate and decision log"]
+        Gateway -->|"Faults, acknowledgements after persistence"| Events
+        Gateway -->|"Samples and heartbeats"| Samples
+        Events --> Hard
+        Samples --> Hard
+        Samples --> Window
+        Events --> History
+        Samples --> History
+        History -->|"Versioned baselines and controls"| Window
+        Hard --> Gate
+        Window --> Gate
+    end
+
+    Spool -->|"mTLS push with retry and deduplication"| Gateway
+    OOB -->|"Independent authenticated push"| Gateway
+    Orchestrator["Deployment orchestrator"]
+    Orchestrator -->|"Deployment lifecycle, manifests and topology"| Gate
+    Gate -->|"Context and expected disruption windows"| Hard
+    Gate -->|"Candidate cohort and control assignments"| Window
+    Gate -->|"HOLD or HALT commands; short-lived CONTINUE permits"| Orchestrator
+    Orchestrator -->|"Fence acknowledgement and in-flight status"| Gate
 ```
+
+Data flow in plain text: **sources -> health client -> durable push -> ingestion -> streams -> evaluators -> rollout gate -> orchestrator**. Independent management/fabric collectors bypass the host. Historical storage supports baselines and investigation without blocking immediate hard-fault evaluation.
+
+### How signals reach the service in near real time
+
+1. **Capture:** subscribe to supported driver/event interfaces for urgent faults; sample GPU/network/storage metrics and heartbeats every five seconds. Retain the source timestamp and entity identity. Do not wait for the next metrics batch to send a critical event.
+2. **Persist locally:** the health client validates and writes each observation to a bounded durable spool. Critical events and heartbeats have reserved capacity; bulk metric traffic cannot starve them. A local handoff is acknowledged only after persistence. Local disk failure must be surfaced, not silently acknowledged.
+3. **Push:** maintain an outbound authenticated connection to the ingestion gateway. Flush critical events immediately and metric batches at most once per second after collection. Sampling delay is separate from batching delay. No inbound host connection is required.
+4. **Accept durably:** the gateway authenticates the producer and accepts the record into the appropriate replicated stream before acknowledging it. The client can then retire the acknowledged spool entry. Partition by stable node/entity identity, and carry topology/deployment IDs for cross-node correlation.
+5. **Evaluate:** the hard-fault evaluator processes critical events without waiting for one-minute aggregation windows. The regression evaluator compares eligible windows with pinned baselines and unchanged controls. Freshness uses receiver-side timers even if a node sends nothing.
+6. **Enforce:** persist `HOLD`/`HALT` and deliver an idempotent fence command immediately. The orchestrator acknowledges the fence and checks fresh promotion permits before dispatching more updates.
+7. **Recover:** on disconnect, retry from the spool with the same event IDs. Duplicate events are safe; missing telemetry or an unreachable decision service prevents new promotion permits. Persistence protects replay, not real-time delivery during a network outage.
+
+The critical-event and metric streams are logical lanes: they may use one broker, but need separate capacity and consumer scheduling so a metric backlog cannot delay a halt. Preserve ordering within each lane; do not assume ordering across lanes. Merge evidence by event identity, timestamps, and epochs.
+
+Run ingestion, streaming, evaluation, and the gate with redundant instances outside the candidate rollout's failure domain. Checkpoint evaluator state and use a single fenced decision authority per deployment scope to avoid conflicting permits. A service failure must stop promotion, not require a potentially unavailable host to send a stop command.
+
+### Critical-event delivery and acknowledgement
+
+```mermaid
+sequenceDiagram
+    participant Source as GPU or driver
+    participant Client as Host health client
+    participant Ingest as Ingestion gateway
+    participant Stream as Durable stream
+    participant Eval as Health evaluator and gate
+    participant Deploy as Deployment orchestrator
+    Source->>Client: New critical event with source time
+    Client->>Client: Persist event ID and sequence in spool
+    Client->>Ingest: Push immediately over authenticated connection
+    Ingest->>Stream: Append critical event
+    Stream-->>Ingest: Durable acceptance
+    Ingest-->>Client: Acknowledge event ID
+    Stream->>Eval: Deliver event for immediate evaluation
+    Eval->>Eval: Classify fault and persist HALT fence
+    Eval->>Deploy: Idempotent HALT command with decision ID
+    Deploy->>Deploy: Fence dispatch and record in-flight updates
+    Deploy-->>Eval: Fence acknowledgement
+    Note over Client,Deploy: Measure source-to-fence-ack latency end to end
+```
+
+Ingestion acknowledgement means the evidence is durable; it does **not** mean deployment has stopped. Fence acknowledgement is a separate, monitored control-plane outcome.
 
 ### Responsibilities
 
 - **Collectors/adapters:** use DCGM/NVML and driver events for GPUs; supported NIC/RDMA, OS, storage, and job instrumentation for other domains. Capture actual observations, not just an agent-authored "healthy" string.
-- **HSDU on host:** normalize identity/units, validate schema, attach deployment context, detect local hard faults, spool durably, and push promptly. A local hard-fault gate can request immediate containment; absence of local failures cannot authorize fleet promotion.
+- **Health client on host:** normalize identity/units, validate schema, attach deployment context, detect local hard faults, spool durably, and push promptly. A local hard-fault gate can request immediate containment; absence of local failures cannot authorize fleet promotion.
 - **Independent sources:** observe host loss, power/cooling, switch health, and optional DPU state even if the host observer fails.
 - **Ingestion/stream:** authenticate producers, validate schema, persist before acknowledging, partition for per-entity ordering, and preserve a separate priority path for critical events.
 - **Online evaluator:** maintain event-time windows, freshness, counter epochs, baselines, controls, topology correlation, and policy decisions. Join by deployment and affected dependency graph.
-- **HealthStore:** retain raw observations, manifests, test artifacts, decisions, and acknowledgement history. Do not put a slow batch warehouse query on the critical-event path.
+- **Historical evidence store:** retain raw observations, manifests, test artifacts, decisions, and acknowledgement history. Do not put a slow batch warehouse query on the critical-event path.
 - **Rollout gate/orchestrator:** persist fences and require fresh positive authorization for promotion.
 
-If existing HealthStore already supports low-latency durable ingestion, stream evaluation, and command delivery, reuse those capabilities. Otherwise add an adapter/stream evaluator beside it. This design does not assume those interfaces already exist.
+If an existing telemetry platform already supports low-latency durable ingestion, stream evaluation, and command delivery, reuse those capabilities. Otherwise add an adapter/stream evaluator beside it. This design does not assume those interfaces already exist.
 
 ### Delivery semantics
 
@@ -336,15 +400,15 @@ If existing HealthStore already supports low-latency durable ingestion, stream e
 - Late hard-fault events still trigger incident evaluation. Bounded late data can recompute soft windows, but replayed history must never turn into a fresh promotion permit.
 - Reserve spool/stream capacity for hard events and heartbeats. When overloaded, downsample noncritical metrics explicitly and emit a data-quality event. Lost required coverage holds the rollout.
 - Expose queue depth, oldest-event age, dropped/rejected observations, per-source freshness, and gate-ack latency.
-- Separate the collector/client rollout from the candidate agent where possible. If updating HSDU/DCGM itself, keep independent observer coverage and validate schema/metric parity before promotion.
+- Separate the collector/client rollout from the candidate agent where possible. If updating the health client or DCGM itself, keep independent observer coverage and validate schema/metric parity before promotion.
 
 An example ten-second critical-event budget is: <=1 second local capture, <=2 seconds publish/durable acceptance, <=2 seconds evaluation, and <=5 seconds fence delivery/acknowledgement. Validate the end-to-end p99 directly; component p99 values do not mathematically guarantee the combined p99.
 
-## 10. Integrating the existing CSV-based HSDU flow
+## 10. Integrating an existing CSV-based client flow
 
 ### Preferred path
 
-Add a local structured observation API, such as a Unix-domain socket or supported local RPC endpoint. HSDU receives events immediately, writes its spool, and pushes them off-node. Use periodic snapshots for reconciliation, not as the only critical-event channel.
+Add a local structured observation API, such as a Unix-domain socket or supported local RPC endpoint. The health client receives events immediately, writes its spool, and pushes them off-node. Use periodic snapshots for reconciliation, not as the only critical-event channel.
 
 For existing producers, add a **CSV compatibility adapter**. This allows incremental migration without requiring all agents to change immediately.
 
@@ -358,8 +422,8 @@ If CSV remains the initial interface:
 4. Watch file-change notifications, with a one-second reconciliation scan to catch missed notifications. File modification time alone does not establish signal freshness.
 5. Reject malformed, truncated, out-of-order, or unsupported records explicitly. Emit a parse/data-quality event and keep the last valid value marked stale when it expires; do not silently substitute `healthy`.
 6. Track producer freshness, not just file existence. A dead agent's old "healthy" row must time out.
-7. Use a separate durable event queue/API for transient hard events. A snapshot can overwrite an error before HSDU reads it. If files are unavoidable, use a validated append-only event journal with sequence numbers, rotation/cursor recovery, and durable acknowledgements.
-8. HSDU's off-node spool retries until accepted and survives its own restart. Disk-full or spool-corruption conditions emit an independent alarm and hold promotion.
+7. Use a separate durable event queue/API for transient hard events. A snapshot can overwrite an error before the health client reads it. If files are unavoidable, use a validated append-only event journal with sequence numbers, rotation/cursor recovery, and durable acknowledgements.
+8. The health client's outbound spool retries until accepted and survives its own restart. Disk-full or spool-corruption conditions emit an independent alarm and hold promotion.
 
 Suggested transitional columns:
 
@@ -373,7 +437,7 @@ If an agent can only publish a binary CSV status, retain it as an advisory signa
 
 ### Example normalized event
 
-This is a proposed envelope, not an existing HSDU API. The sample identifier and timestamp are illustrative.
+This is a proposed envelope, not an existing client API. The sample identifier and timestamp are illustrative.
 
 ```json
 {
@@ -443,20 +507,20 @@ An emitted decision should contain at least:
 
 Persist both the decision and the orchestrator acknowledgement. Store explicit eligibility/expiry on `CONTINUE` permits; `HALT` remains latched until audited resolution.
 
-## 11. Should HSDU move to the SoC?
+## 11. Should the health client move to the SoC?
 
 **Not as a prerequisite, and not as a wholesale replacement for the host client. Use a split design.**
 
 | Placement | Best visibility | Important limitations | Recommendation |
 |---|---|---|---|
-| Bare-metal host | GPU APIs/events, CUDA, runtime access, application performance, OS/storage stack | Can disappear during host failure/update; shares resources with workloads | Primary HSDU collector/client |
+| Bare-metal host | GPU APIs/events, CUDA, runtime access, application performance, OS/storage stack | Can disappear during host failure/update; shares resources with workloads | Primary health collector/client |
 | SoC/DPU, if present | Independent heartbeat, DPU/NIC/offload path, some management observations | GPU telemetry/access is platform-specific; cannot assume host CUDA/NCCL visibility; may share power/network failures | Optional independent collector, relay, and watchdog |
 | BMC/out-of-band collector | Power/cooling, hardware logs, host power state | Limited sensor refresh and application visibility; affected by BMC updates | Independent hardware-health evidence |
 | Off-node control plane | Fleet history, controls, correlation, durable deployment fences | Depends on ingestion/connectivity and good identity/topology data | Authoritative rollout evaluation and enforcement integration |
 
 Moving everything to a DPU would not solve host-library regressions, job correctness, or data-loader stalls. A relay on the DPU can improve survivability if the platform supports it, but a separate management path and failure-domain analysis matter more than the processor label.
 
-If HSDU itself is required to remain alive through host reboot, consider an SoC-resident **supervisor/relay** while retaining a host helper for in-band evidence. Confirm supported access, signing/upgrade ownership, resource isolation, and management-network reachability first. During DPU or BMC updates, do not treat that same component as the sole independent observer.
+If the client supervision or relay function must remain alive through host reboot, consider an SoC-resident **supervisor/relay** while retaining a host helper for in-band evidence. Confirm supported access, signing/upgrade ownership, resource isolation, and management-network reachability first. During DPU or BMC updates, do not treat that same component as the sole independent observer.
 
 ## 12. Update-specific validation profiles
 
@@ -465,7 +529,7 @@ All profiles retain common correctness, availability, and freshness gates; profi
 | Candidate update | Additional mandatory evidence |
 |---|---|
 | Host/security/management agent | Agent overhead budget, GPU device permissions, runtime probe, comparable job throughput, basic collective/data-feed check |
-| HSDU/DCGM/telemetry configuration | Independent observation, old/new field and unit parity, event loss/duplication/restart tests, gate delivery and coverage |
+| Health client/DCGM/telemetry configuration | Independent observation, old/new field and unit parity, event loss/duplication/restart tests, gate delivery and coverage |
 | Driver/kernel/GPU firmware | Compatibility manifest, all-GPU compute/memory correctness, GPU topology, intra/inter-node communication, reset/reboot recovery |
 | Fabric Manager/NVLSM/NVSwitch firmware | Fabric initialization and partitions, all required links, intra-node collectives, representative inter-node group, recovery scope |
 | NIC/RDMA/DPU/network agent | Every required rail, GPU-direct transport where required, RDMA latency/throughput, collectives, endpoint/switch correlation |
@@ -477,7 +541,7 @@ Tests need explicit duration, timeout, resource ownership, retry, and cleanup bu
 
 ## 13. Implementation sequence
 
-1. **Inventory and policy contract:** confirm HSDU interfaces, SoC meaning/capabilities, hardware generations, fabric/storage stack, deployment events, scheduler integration, and orchestrator fencing API.
+1. **Inventory and policy contract:** confirm health client interfaces, SoC meaning/capabilities, hardware generations, fabric/storage stack, deployment events, scheduler integration, and orchestrator fencing API.
 2. **Minimum viable safety gate:** host heartbeat, GPU inventory/runtime access, classified fatal events, new uncorrectable memory errors, required fabric readiness, and durable halt/acknowledgement. Start with CSV compatibility where needed.
 3. **Performance gate:** capture fixed baselines and unchanged controls; add compute/HBM, intra-node, inter-node, and storage/data-feed probes.
 4. **Shadow evaluation:** record decisions without halting; replay historical incidents and quantify false positives, missed failures, detection delay, and source overhead.
@@ -506,7 +570,7 @@ Measure source-to-fence latency, sustained-regression-to-decision latency, false
 
 ## 14. Decisions to confirm before coding
 
-- What HSDU stands for internally, which APIs it already exposes, and whether HealthStore supports durable low-latency streams and online evaluation.
+- Which client APIs already exist, and whether the existing telemetry platform supports durable low-latency streams and online evaluation.
 - Whether SoC means DPU/management SoC here and which GPU/host observations it can actually access.
 - GPU models/generations, expected GPU/MIG/link/rail topology, and supported driver/firmware combinations.
 - Kubernetes, Slurm, or another scheduler; required checkpoint/drain behavior and available spare capacity.
@@ -527,4 +591,4 @@ The architectural choices and threshold values are recommendations in this READM
 6. [NVIDIA UFM telemetry fields](https://docs.nvidia.com/networking/display/ufmenterpriseumv6222/high-frequency+(primary)+telemetry+fields): fabric counter availability and collection characteristics.
 7. [NVIDIA GPUDirect Storage troubleshooting guide](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/contents.html): path support, diagnostics, and storage-specific statistics.
 
-Exact Azure-internal agent composition, private HSDU contracts, and SoC placement constraints are not established by these public references. Validate them with the platform owners before selecting adapters or approving production enforcement.
+Exact Azure-internal agent composition, existing private client/service contracts, and SoC placement constraints are not established by these public references. Validate them with the platform owners before selecting adapters or approving production enforcement.
