@@ -69,61 +69,106 @@ Expose `PASS`, `WARN`, `FAIL`, and `UNKNOWN` for each dimension and domain. A fi
 
 An idle GPU can be healthy but unvalidated for performance. A node with no errors and no telemetry is not healthy.
 
-## 4. Key metrics and supporting evidence
+## 4. Named health-signal contract
 
-**Key metrics** directly establish safety, availability, correctness, or delivered performance. **Supporting metrics** explain a symptom and help distinguish update effects from workload or infrastructure noise.
+These are the **health signals this service will produce**, not a list of things an operator could measure. Signal IDs are stable API identifiers owned by this design; they are not vendor metric names. Raw metrics/events are evidence used to compute a signal.
 
-Collect GPU-specific evidence per GPU UUID, MIG instance where applicable, link, and port. Also retain node-level and job-level views. Never gate on a cluster average alone.
+There are three decision classes:
 
-### 4.1 Compute, memory, and GPU-local fabric
+- **Critical, standalone:** any one confirmed `FAIL` stops the active rollout wave. No second signal is needed.
+- **Critical, composite:** a named performance/deterioration signal stops the wave when its impact and confirmation conditions are met.
+- **Good-to-have, supporting:** abnormal context explains a regression but never independently halts deployment. Absence of optional context must not disable repeated end-to-end regression detection.
 
-| Signal | Role | Source examples | How to use it |
+Observability signals separately **hold promotion** when the service cannot make a safe decision. They do not label an unobserved GPU as defective.
+
+### 4.1 Common evaluation contract
+
+- Every signal carries `signal_id`, `definition_version`, `state`, entity/scope, deployment ID, evaluation window, source/evidence IDs, policy version, baseline ID when relevant, and a reason. Raw numeric values retain units and collection quality.
+- `PASS` means sufficient current evidence satisfies the definition; `WARN` means a noncritical anomaly or unconfirmed primary regression; `FAIL` means the catalog's failure predicate is satisfied; `UNKNOWN` means required evidence is absent, stale, invalid, or incomparable.
+- For supporting signals, `WARN` means their anomaly predicate is true. They never emit a deployment-stopping `FAIL` merely because an explanatory metric is abnormal.
+- Applicability is an explicit profile field, not a healthy default: for example, no NVSwitch/GDS signal is required on a platform without that feature. Report excluded signals with the exclusion reason. Missing evidence for an applicable mandatory signal is `UNKNOWN`.
+- `R` is the update profile's **recovery deadline**, measured from the recorded start of the permitted disruption. Outside a permitted disruption, use a separately configured bounded confirmation timeout. During planned disruption, unavailable resources remain unvalidated and promotion stays blocked.
+- A transient probe failure needs one bounded retry on reserved resources with a known-good reference endpoint where applicable. A verified integrity fault, authoritative fatal event, or platform-critical alarm does not wait for a retry.
+- All performance drops/rises below are control-adjusted, beyond baseline noise, and based on comparable work as defined in section 5. Unless stated otherwise, require three consecutive eligible one-minute windows.
+- Warning thresholds, timeouts, supported capabilities, mandatory sources, and p99 sample requirements are explicit versioned profile parameters. Reject an incomplete profile at precheck with `HEALTH_EVIDENCE_INCOMPLETE`; do not invent universal vendor limits or silently skip a rule.
+
+Emit per GPU UUID/MIG instance, required link/rail/path, node, or communication group as appropriate. A failed entity cannot be hidden by averaging healthy peers. Use the same ID before and after deployment; policy and evidence determine the state.
+
+### 4.2 Critical standalone signals: one failure stops deployment
+
+The last column defines `FAIL -> HALT`. Preserve the affected entity and dependency group even when the rollout fence covers the whole active wave.
+
+| Signal ID | Definition: when this signal fails | Why it matters | Decision timing and scope |
 |---|---|---|---|
-| GPU presence, responsiveness, CUDA context/kernel success, expected schedulable resources | Key | NVML/DCGM, scheduler/device-plugin state, bounded runtime probe | Required GPU missing or unusable after the recovery deadline is a hard failure. Match UUIDs/topology, not enumeration indices. |
-| New uncorrectable GPU memory errors; recovery-required or unrecoverable GPU state | Key | DCGM/NVML, driver events | A new confirmed uncorrectable error is a hard gate. Distinguish contained application impact, required recovery action, and node-wide impact. |
-| Xid/SXid events and GPU recovery action | Key, classified | Driver event stream/kernel logs, NVML/DCGM | Use a versioned vendor-informed classification. Do not treat every nonzero Xid as a node failure or difference successive Xid codes as a counter [4]. |
-| Memory row-remap failure, exhausted spare capacity, pending recovery/remap state | Key for failure; otherwise supporting | DCGM/NVML | Remapping failure is critical. Successful historical remaps are not automatically failures; pending states need SKU-specific maintenance policy. |
-| Known-work compute throughput and HBM bandwidth; validation/checksum correctness | Key | Fixed compute/memory probe or matched workload instrumentation | Compare identical precision, shapes, batch, clocks/power policy, and placement. Incorrect output fails independently of speed. |
-| Required NVLink/NVSwitch connectivity and fabric readiness | Key | NVML/DCGM, Fabric Manager/NVLSM, topology inventory | Loss of required connectivity after recovery is a hard availability failure. Disabled/unpopulated links are not failures. |
-| Intra-node collective bandwidth/latency and correctness | Key | Controlled NCCL test or equivalent | Detect a server whose individual GPUs work but whose GPU-to-GPU fabric is degraded. |
-| Correctable ECC rate and concentration | Supporting | DCGM/NVML | Detect bursts and concentration on one device; combine with memory/compute degradation or a classified memory-health warning. |
-| SM activity, tensor activity, GPU utilization, HBM activity, memory allocation | Supporting | DCGM profiling and standard fields | Workload context, not independent health verdicts. Low utilization can mean the job is waiting for data. |
-| Temperature, thermal/power violation duration, clocks, throttle reasons, power draw/cap | Supporting; platform-critical alarms are key | DCGM/NVML and BMC | Combine sustained abnormal throttling with comparable-work slowdown. Expected power capping alone is not a fault. Use vendor platform safety alarms directly. |
-| PCIe negotiated width/speed under load, replay/error rates, AER events; NVLink error/recovery rates | Supporting; fatal/unrecoverable events are key | DCGM/NVML, kernel AER, platform telemetry | Correlate with transfer/collective regression. Interpret error semantics by generation; link-idle power saving is not a regression. |
+| `GPU_DEVICE_UNAVAILABLE` | At least one GPU UUID or required MIG instance in the approved inventory is absent or unresponsive, or its expected scheduler resource is missing after device discovery completes. Evidence distinguishes a confirmed missing device from a failed collector. | A node can be `Ready` while usable GPU capacity has disappeared. | Fail after `R` during recovery, or bounded confirmation outside maintenance; scope is GPU/instance and node. |
+| `GPU_EXECUTION_FAILED` | A reserved probe in the actual workload runtime cannot create a CUDA context, allocate its fixed test buffer, or complete its known kernel before the profile timeout on a required GPU, including the bounded retry. | Host visibility does not prove that containers/jobs can use the GPU; catches permissions, driver/runtime and initialization failures. | Fail after the retry and applicable recovery allowance; GPU/runtime scope. Customer application OOM is not this signal. |
+| `GPU_UNCORRECTABLE_MEMORY_ERROR` | At least one new uncorrectable GPU memory error is established by an authoritative event or a positive counter delta within the same device/counter epoch. | Computation may be lost or unsafe; waiting for a throughput decline adds no useful protection. | Fail immediately on confirmation; GPU scope. An old lifetime total alone does not fail. |
+| `GPU_MEMORY_REPAIR_FAILED` | The GPU reports row-remapping failure or a vendor-defined memory repair/spare-exhaustion state that requires taking it out of service. | Memory fault containment can no longer be trusted. | Fail immediately on authoritative state; GPU scope. A successful historical remap or pending maintenance alone is not failure. |
+| `GPU_FATAL_FAULT` | A current Xid/SXid, recovery-action state, fatal PCIe/AER event, or equivalent platform event is classified by the versioned platform policy as unrecoverable or requiring isolation/reset of a required resource. | A seemingly live GPU/fabric may not safely execute further work without recovery. | Fail immediately outside declared reset activity; expected reset events are evaluated against recovery completion. GPU, node or fabric-partition scope [4]. |
+| `GPU_RESULT_INCORRECT` | A deterministic compute/memory/collective correctness probe returns a value outside its fixed numerical tolerance or a mismatched exact checksum. The expected result, seed, precision and tolerance are part of the probe version. | Silent wrong answers are worse than visible slowdown and can occur with clean utilization/error counters. | Fail immediately on a verified mismatch; no second performance signal or retry is required. |
+| `GPU_FABRIC_UNAVAILABLE` | The required NVLink/NVSwitch topology or partition differs from the approved topology, or required fabric initialization is not successful, making a mandatory GPU-to-GPU route unavailable. | Individual GPUs can pass local compute tests while the server's collective fabric is unusable. | Fail after `R` or bounded confirmation outside maintenance; GPU fabric/partition scope. Intentionally disabled links are excluded. |
+| `GPU_COLLECTIVE_FAILED` | A required reserved intra-node or inter-node collective fails to complete within its profile timeout after the bounded retry against a validated group. | A failed rank/link can hang the complete distributed job despite healthy individual nodes. | Fail once confirmed and outside the allowed disruption; communication-group scope. Incorrect output instead triggers `GPU_RESULT_INCORRECT`. |
+| `RDMA_PATH_UNAVAILABLE` | A mandatory NIC rail is down, a required RDMA/GPU-direct transfer fails after retry, or a workload requiring that transport demonstrably falls back to a disallowed transport. | Basic IP reachability cannot establish the data path needed for distributed GPU jobs. | Fail after `R` or bounded confirmation; rail/path/group scope. Reduced but still allowed bandwidth is a regression, not this signal. |
+| `STORAGE_PATH_UNAVAILABLE` | A mandatory dataset/checkpoint path cannot complete its bounded read/write/restore operation after retry; an uncorrectable I/O error prevents a required operation; or a profile-required direct-storage path is unavailable/disallowed fallback is confirmed. | Jobs cannot feed GPUs or recover safely if their data/checkpoint path is broken. | Fail after applicable recovery/operation timeout; volume/path/node or shared-storage scope. Only use dedicated test artifacts. |
+| `STORAGE_DATA_INTEGRITY_FAILED` | A known input block or dedicated checkpoint artifact fails its expected checksum or verified restore-content comparison. | Fast I/O is not healthy I/O if training data or recovery state is corrupted. | Fail immediately on verified mismatch; data-path scope. A slow restore without content failure is evaluated separately. |
+| `PLATFORM_SAFETY_CRITICAL` | An authoritative OEM/platform sensor or event declares critical thermal, cooling, power-delivery, PSU or hardware safety failure. | Continuing a rollout during platform distress increases outage risk and confounds all performance evidence. | Fail immediately; affected node/rack scope. Ordinary temperature rise or expected power capping does not qualify. |
+| `NODE_RECOVERY_FAILED` | A node does not return and satisfy its required host, driver, runtime, scheduler and fabric readiness checks before `R`. | A rollout must not continue replacing capacity when earlier nodes cannot recover. | Fail at the deadline; node and inseparable job-group scope. Observer loss alone first uses the observability hold signals below. |
 
-Representative DCGM fields include `DCGM_FI_DEV_GPU_TEMP`, `DCGM_FI_DEV_POWER_USAGE`, `DCGM_FI_DEV_SM_CLOCK`, `DCGM_FI_DEV_GPU_UTIL`, `DCGM_FI_DEV_ECC_SBE_VOL_TOTAL`, `DCGM_FI_DEV_ECC_DBE_VOL_TOTAL`, and `DCGM_FI_DEV_PCIE_REPLAY_COUNTER`. These are examples, not a universal exporter configuration. Field support, units, and exporter names vary with GPU generation and DCGM version [1][2].
+### 4.3 Critical composite signals: sustained regression stops deployment
 
-Keep the last Xid value distinct from an event count. Prefer a driver event stream plus durable event identifiers; repeated identical Xids can be missed if only a last-value gauge is sampled. Profiling fields can have collection/multiplexing constraints; budget and validate their overhead.
+Here, "primary" is useful-work impact, and "support" refers to the named signals in section 4.4. Primary impact without sufficient confirmation is `WARN -> HOLD` for retest, not permission to promote. Shared degradation of controls produces `HOLD` pending incident investigation rather than candidate attribution.
 
-### 4.2 Networking: GPU-to-GPU across nodes
-
-| Signal | Role | Source examples | How to use it |
+| Signal ID | Primary impact definition | Condition that turns it into `FAIL -> HALT` | Why it matters |
 |---|---|---|---|
-| Inter-node collective success, timeout rate, algorithmic/bus bandwidth, tail duration | Key | NCCL tests, distributed job telemetry | Gate on fixed group size, message size, algorithm/protocol, NIC rails, placement, and expected transport. A one-node test is insufficient. |
-| RDMA connection/data-transfer success and latency/throughput | Key | Bounded RDMA probe and transport instrumentation | Confirm that the intended RDMA/GPU-direct path still works, not merely that TCP ping succeeds. |
-| Required NIC/rail availability, link speed/width and reachability | Key | NIC telemetry, RDMA tools, fabric controller | A missing mandatory rail or failed required connection is a failure after the recovery deadline. |
-| Link integrity errors, uncorrectable FEC, link flaps, transport retries/timeouts | Supporting; loss of required service is key | NIC and switch counters | Require new rates and correlate endpoints with switch ports; localize bad cable/port versus host change. |
-| InfiniBand transmit wait, RoCE ECN/CNP, PFC pause duration, queue occupancy/drops | Supporting | Fabric controller, switches, NIC counters | Congestion is evidence, not proof of a defective GPU. Normalize by link rate and interval; correlate with collective degradation [6]. |
-| Per-rail traffic distribution, fallback transport, CPU/NUMA locality | Supporting | NCCL logs/telemetry, NIC counters, placement data | Detect one unused rail or silent RDMA-to-TCP fallback. A fallback is a capability failure if RDMA is required by contract. |
+| `GPU_COMPUTE_REGRESSION` | Fixed compute-probe throughput falls >10%. Precision, shapes, power policy and placement are unchanged. | Primary impact AND (`GPU_THROTTLING_ABNORMAL` OR `GPU_CLOCK_ABNORMAL` OR `GPU_MEMORY_WARNING`) in each of three eligible windows. | Detects lost useful compute despite GPUs remaining visible and responsive. |
+| `GPU_HBM_BANDWIDTH_REGRESSION` | Fixed GPU-memory probe's effective HBM bandwidth falls >10% at the same working set and access pattern. | Primary impact AND (`GPU_MEMORY_WARNING` OR `GPU_THROTTLING_ABNORMAL` OR `GPU_CLOCK_ABNORMAL`) in each of three eligible windows. | Memory-bound jobs can regress while compute-only tests still pass. |
+| `GPU_LOCAL_FABRIC_REGRESSION` | Intra-node collective bandwidth falls >15% OR p99 duration rises >20%, for the same group/message size and algorithm. | Primary impact AND (`GPU_LINK_WARNING` OR `GPU_FABRIC_WARNING`) in each of three eligible windows. | Detects degraded GPU-to-GPU communication before it becomes complete fabric failure. |
+| `GPU_CLUSTER_FABRIC_REGRESSION` | Inter-node collective bandwidth falls >15% OR p99 duration rises >20%, for the same placement, rails, group/message size and transport. | Primary impact AND (`RDMA_TRANSPORT_WARNING` OR `NETWORK_CONGESTION_WARNING` OR `NETWORK_RAIL_IMBALANCE`) in each of three eligible windows. | One bad rail or communication straggler can slow the entire distributed job. |
+| `GPU_STORAGE_FEED_REGRESSION` | Matched storage read/write throughput falls >20% OR p99 I/O/checkpoint duration rises >25%, with dataset, cache state and concurrency matched. | Primary impact AND (`GPU_INPUT_STARVATION` OR `STORAGE_PATH_WARNING`) in each of three eligible windows. | Captures slower data delivery or checkpointing that wastes GPU capacity or lengthens recovery. |
+| `GPU_MEMORY_DETERIORATION` | New correctable ECC error rate exceeds both the SKU's configured warning rate and baseline noise. | Primary impact AND (compute/HBM primary impact above OR `GPU_MEMORY_WARNING` with a separate vendor memory-health/remap reason) in each of three eligible windows. The ECC warning cannot corroborate itself. | Detects worsening memory before an uncorrectable fault without treating every corrected bit as a deployment failure. |
+| `HOST_AGENT_INTERFERENCE` | Matched job throughput falls >10% OR p99 step duration rises >20%. | Primary impact AND `HOST_RESOURCE_INTERFERENCE` in each of three eligible windows. | A management/security agent can starve the CPUs, memory or locality needed to keep GPUs productive. |
+| `GPU_UNEXPLAINED_PERFORMANCE_REGRESSION` | Compute/HBM/collective throughput falls >20% OR p99 collective duration rises >30%, even with no abnormal supporting signal. | Reproduced in two independent reserved-canary runs against stable controls; each exceeds its noise and sample requirements. | Prevents a real silent regression escaping simply because diagnostic counters do not explain it. |
+| `WORKLOAD_SLO_BREACH` | A required workload exceeds its explicitly configured throughput floor, tail-latency ceiling or checkpoint/recovery deadline for its approved evaluation duration. | Its profile's minimum samples and confirmation rule are satisfied; no diagnostic supporting signal is required. The SLO and duration must be approved before rollout. | Absolute customer/recovery commitments still matter when controls also regress. |
 
-Report both end-to-end collective impact and the affected fabric scope. Two endpoints reporting the same bad link are one fault, not two independent node failures.
+The predicates above are authoritative; do not make a weighted average of them. A `FAIL` from any applicable critical composite signal halts the wave. Equality at a `>10%` threshold does not fail that threshold.
 
-### 4.3 Storage and the GPU data path
+### 4.4 Good-to-have supporting signals: explain, do not stop alone
 
-| Signal | Role | Source examples | How to use it |
-|---|---|---|---|
-| Read/write correctness, uncorrectable media/I/O errors, filesystem availability | Key | NVMe/OS/storage-client telemetry, safe checksum probe | New integrity failure or loss of a required data/checkpoint path is a hard gate. |
-| Matched read throughput, p95/p99 latency, timeout/error rate | Key | Storage client and controlled read probe | Fix dataset, I/O size, queue depth, cache state, locality, and concurrency. Measure the path used by jobs. |
-| Checkpoint completion, duration, and verified restore on a test artifact | Key | Framework/checkpoint telemetry | Needed for updates that affect storage or recovery; write only to dedicated test locations with quotas. |
-| Expected GPUDirect Storage path active and functional | Key when required; otherwise supporting | GDS support checks, cuFile/nvidia-fs telemetry, targeted GDS I/O | Detect unsupported or failed direct I/O and unexpected fallback. A capability check alone does not establish throughput [7]. |
-| GPU input-wait fraction and data-loader wait | Supporting | Framework/job instrumentation | Combine with lower storage throughput or higher latency. Not a universally available DCGM metric. |
-| Disk utilization/queue depth, CPU I/O wait, NVMe health/temperature, storage network congestion, cache hit rate | Supporting | OS, NVMe, storage backend, NIC/switch telemetry | Distinguish local driver regression, shared storage incident, and workload/cache effects. |
+The following are named `WARN` signals. A profile stores each warning limit with units and an exposure interval. For counter-rate anomalies, require both the configured warning limit and the baseline noise bound to be exceeded; positive historical totals are insufficient.
 
-### 4.4 Host and management signals
+| Signal ID | Definition of abnormal state (`WARN`) | Why it matters / what it supports |
+|---|---|---|
+| `GPU_THROTTLING_ABNORMAL` | Fraction of sampled active time with thermal or hardware-slowdown reasons exceeds the profile's allowed fraction under matched demand. Configured, expected power-cap throttling is excluded. | Explains compute/HBM loss caused by cooling or enforced hardware slowdown. Attach temperature, power draw/cap and reason bits. |
+| `GPU_CLOCK_ABNORMAL` | Median active SM or memory clock is >10% below the matched baseline at the same demand and power policy, beyond normal clock variation. | Detects clock-policy/firmware changes; explains compute/HBM regression, not idle downclocking. |
+| `GPU_MEMORY_WARNING` | New correctable ECC rate exceeds its SKU warning limit and baseline noise, OR an explicit vendor memory-health warning/pending-remap condition is present. Attach distinct `ECC_RATE`, `VENDOR_HEALTH` or `REMAP_PENDING` reason codes. | Localizes memory deterioration. Only the latter two independent reasons can corroborate an ECC-rate primary in `GPU_MEMORY_DETERIORATION`. |
+| `GPU_LINK_WARNING` | PCIe replay/AER-correctable or NVLink error/recovery rate exceeds its link-generation warning limit and noise, OR negotiated width/speed under load is below the approved nonfatal operating profile. | Explains GPU transfer/collective loss. Fatal events and missing required links use hard signals instead. |
+| `GPU_FABRIC_WARNING` | Fabric Manager/NVLSM or the platform fabric monitor reports a nonfatal warning on a required initialized partition while all mandatory routes remain usable. | Explains local collective loss without confusing advisory fabric state with complete unavailability. |
+| `RDMA_TRANSPORT_WARNING` | New retry, timeout, link-flap or uncorrectable-FEC rate exceeds the rail's warning threshold and noise while required transfers still succeed, OR an allowed-but-unexpected transport change is observed. | Explains inter-node communication degradation and localizes the affected rail/endpoint. Disallowed fallback uses `RDMA_PATH_UNAVAILABLE`. |
+| `NETWORK_CONGESTION_WARNING` | Normalized InfiniBand transmit-wait fraction, RoCE PFC-pause fraction or queue-drop rate exceeds its configured limit and baseline noise. Attach ECN/CNP rates as context, not faults by themselves. | Separates fabric congestion from GPU compute failure and supports cluster-fabric regression [6]. |
+| `NETWORK_RAIL_IMBALANCE` | A rail's fraction of traffic differs from its topology/workload-specific expected share by more than the configured percentage-point limit under sufficient offered load. | Finds an unused/underused rail hidden by aggregate NIC traffic. Balanced traffic is not assumed for every routing policy. |
+| `GPU_INPUT_STARVATION` | Framework-reported input-wait fraction rises >10 percentage points above its matched baseline, beyond noise, while work remains queued. | Explains storage/data-feed regression. Low GPU utilization alone is not input starvation. |
+| `STORAGE_PATH_WARNING` | New I/O retry/timeout rate, queue latency or device-health warning exceeds its profile limit and baseline where applicable, OR an allowed-but-unexpected GDS fallback occurs while I/O still succeeds. | Explains storage slowdown and differentiates direct-path changes from backend load [7]. |
+| `HOST_RESOURCE_INTERFERENCE` | The updated agent's CPU/memory usage exceeds its approved budget AND host CPU scheduling pressure, memory pressure or locality-sensitive worker stall exceeds its matched warning limit. | Correlates agent resource use with contention that can starve GPU work; high agent CPU alone is insufficient. |
 
-Always collect host CPU/memory pressure, OOM events, driver/module/service state, kernel faults, scheduler readiness, collector health, time synchronization, BMC power/cooling alarms, PSU/fan status, and hardware event logs. These are supporting context except for required-service loss, host failure, and platform-critical alarms.
+Keep utilization, SM/tensor activity, allocated memory, temperatures within normal limits, cache hit rates, CPU I/O wait and general host logs as raw diagnostic context. They are **not additional stop signals**. Every composite rule names exactly which supporting signals it accepts.
 
-The BMC may expose only a subset of GPU sensors and cannot generally validate CUDA, NCCL, GPU memory correctness, or the container data path. Redfish/events and management polling are platform-dependent and may be slower than host telemetry.
+### 4.5 Mandatory observability signals: stop promotion, not diagnosis
+
+| Signal ID | Definition | Deployment action and why it matters |
+|---|---|---|
+| `HEALTH_TELEMETRY_STALE` | Host heartbeat age >15 seconds OR an applicable required fast source's observation age >20 seconds, accounting for detected source clock skew. | `UNKNOWN -> HOLD` immediately outside declared maintenance; no fresh permit during maintenance either. A dead client must not leave an old healthy verdict in force. |
+| `HEALTH_EVIDENCE_INCOMPLETE` | Required source/field/profile parameter is absent or invalid; eligible fast-sample coverage is <95%; or a mandatory test lacks its required observations, comparable baseline/control, or approved tail-latency sample count. | `UNKNOWN -> HOLD`. No-work, unsupported-required fields and bad CSV/schema are explicit reasons, not healthy defaults. |
+| `ROLLOUT_FENCE_UNACKNOWLEDGED` | The orchestrator has not acknowledged a persisted `HOLD`/`HALT` fence by the configured command-acknowledgement deadline. | Control-channel `FAIL`: keep the existing fence/action latched, hold all promotion, retry delivery and alert the rollout owner. A detected GPU fault is not contained merely because an alert was emitted. |
+
+A missed node recovery deadline additionally produces `NODE_RECOVERY_FAILED`. An ingestion/control-plane outage blocks permits even if no host report reaches the evaluator.
+
+### 4.6 Evidence adapters are separate from signal names
+
+Map DCGM/NVML and driver events to GPU inventory, memory, fault, clock and link evidence; reserved CUDA/memory/NCCL probes to execution, correctness and performance; NIC/switch telemetry to rail/transport/congestion evidence; and storage/job instrumentation to I/O, checkpoints and input wait. The service evaluates the catalog above over that normalized evidence.
+
+For example, `DCGM_FI_DEV_ECC_DBE_VOL_TOTAL` is raw evidence for `GPU_UNCORRECTABLE_MEMORY_ERROR`, not the health signal itself. Field support, units and exporter names vary with GPU/DCGM versions [1][2]. Keep last-Xid values separate from event counts; repeated identical Xids require event capture rather than code arithmetic.
+
+Mandatory runtime tests run only on reserved/drained resources with explicit timeouts. The BMC cannot establish CUDA/NCCL correctness and cannot replace host evidence. Two endpoints reporting the same faulty link remain one fault, not independent confirmation.
 
 ## 5. Comparing before and after without false conclusions
 
@@ -172,14 +217,26 @@ Controls help attribution, but **do not excuse an absolute availability, correct
 
 ### 6.1 Hard gates: one confirmed condition is enough
 
-Any of the following produces `FAIL` and `HALT` for the active rollout wave, with containment scoped to the affected resource:
+The standalone signals in section 4.2 are an **OR**, never an AND or an average:
 
-1. New uncorrectable GPU memory error, confirmed computation/data-integrity failure, or row-remapping failure.
-2. A vendor-classified fatal/unrecoverable GPU/NVSwitch fault, GPU lost from the bus, or recovery-required state that makes a required resource unsafe/unavailable.
-3. Missing/unresponsive required GPU, required NVLink/NVSwitch fabric, NIC rail, storage path, or runtime GPU access after its recovery deadline.
-4. Confirmed collective/probe failure on a reserved canary after one bounded infrastructure-aware retry, or a required production communication path demonstrably unavailable. A verified real correctness error does not wait for a retry.
-5. Platform-critical power/thermal/cooling alarm according to OEM limits.
-6. Host fails to return and pass required readiness checks before its update-specific deadline.
+```text
+HALT when any applicable standalone signal is FAIL:
+  GPU_DEVICE_UNAVAILABLE
+  GPU_EXECUTION_FAILED
+  GPU_UNCORRECTABLE_MEMORY_ERROR
+  GPU_MEMORY_REPAIR_FAILED
+  GPU_FATAL_FAULT
+  GPU_RESULT_INCORRECT
+  GPU_FABRIC_UNAVAILABLE
+  GPU_COLLECTIVE_FAILED
+  RDMA_PATH_UNAVAILABLE
+  STORAGE_PATH_UNAVAILABLE
+  STORAGE_DATA_INTEGRITY_FAILED
+  PLATFORM_SAFETY_CRITICAL
+  NODE_RECOVERY_FAILED
+```
+
+Apply the exact confirmation, applicability, and recovery timing from the catalog. At precheck, an existing standalone failure makes the node ineligible; during a candidate wave, a new failure fences that wave. Neither a known bad baseline nor a healthy fleet average cancels a failure.
 
 Confirmation means valid identity, current event/state, appropriate severity classification, and trustworthy source. It does **not** mean waiting for a second metric to confirm a genuine uncorrectable error.
 
@@ -187,27 +244,34 @@ A workload-specific illegal-access Xid, application OOM, historical ECC count, o
 
 ### 6.2 Soft gates: combine impact with evidence
 
-Evaluate each rule in one-minute windows. Initially require **three consecutive eligible bad windows**, with the supporting condition present in each. Soft `HALT` rules require a comparable-work match, adequate coverage, and an effect beyond baseline noise. If control evidence is absent or conflicting, use `HOLD` unless an absolute gate fails.
+Evaluate the named composite predicates in section 4.3. Their thresholds and accepted supporting signal IDs are defined there once, rather than independently redefined in rollout code.
 
-| Rule | Primary impact X | Corroboration Y | Decision |
-|---|---|---|---|
-| Compute regression | Control-adjusted compute throughput drop >10% | New sustained thermal/hardware-slowdown activity, clocks >10% below matched expectation, or classified GPU/memory warning | `HALT` |
-| GPU-local fabric regression | Intra-node collective bandwidth drop >15% or p99 duration rise >20% | New abnormal NVLink/PCIe error rate, degraded required topology, or fabric health warning | `HALT`; missing required topology already uses a hard gate |
-| Cluster fabric regression | Inter-node collective bandwidth drop >15% or p99 duration rise >20% | New transport retries/timeouts, abnormal congestion/pause duration, rail imbalance, or unintended transport change | `HALT` when canary-local; `HOLD` if controls show a shared incident |
-| Storage/data-feed regression | Comparable storage throughput drop >20% or p99 latency rise >25% | Increased GPU input wait, new I/O timeout rate, unintended GDS fallback, or a storage-client health warning | `HALT` when candidate-local; otherwise `HOLD` |
-| Memory deterioration | Correctable ECC rate above the SKU-specific warning threshold and healthy baseline | Compute/HBM regression or a vendor-classified memory-health warning | `HALT`; isolated correctable errors alone produce `WARN` |
-| Host-agent interference | Job throughput drop >10% or p99 step latency rise >20% | Agent CPU/memory overhead or NUMA/CPU contention exceeds its measured budget | `HALT` |
+For example:
 
-For clock/throttle and congestion conditions, require activity above a calibrated platform-specific threshold, not merely a nonzero counter. Do not set one temperature, ECC-rate, PCIe-replay, or PFC threshold for every GPU and fabric generation.
+```text
+GPU_CLUSTER_FABRIC_REGRESSION = FAIL when, in each of 3 eligible windows:
+  (control_adjusted_bandwidth_drop > 15%
+   OR control_adjusted_p99_duration_rise > 20%)
+  AND
+  (RDMA_TRANSPORT_WARNING = WARN
+   OR NETWORK_CONGESTION_WARNING = WARN
+   OR NETWORK_RAIL_IMBALANCE = WARN)
+```
+
+Eligible means comparable workload/topology, sufficient samples, fresh evidence, stable controls, and an effect beyond the baseline noise bound. A corroborator must overlap the primary impact on the same entity or a known dependency path, not an unrelated hot GPU or congested rack.
+
+For correctable ECC, `GPU_MEMORY_DETERIORATION` uses the compute/HBM **primary impact**, not the final composite verdict, to avoid circular dependencies. Its vendor-warning alternative must not be another representation of the same ECC-rate observation.
 
 **Important exceptions to "X AND Y":**
 
-- An end-to-end compute or collective throughput drop >20%, or p99 duration rise >30%, can halt **without an explanatory counter** if reproduced in two independent reserved-canary runs against stable controls. Each run must exceed the noise envelope and its own minimum sample requirements. Silent regressions must not escape because hardware counters look clean.
-- One strong primary regression without corroboration produces `HOLD` and an immediate targeted retest, not `CONTINUE`.
-- A required production SLO breach can halt independently under that workload's approved policy.
+- `GPU_UNEXPLAINED_PERFORMANCE_REGRESSION` halts **without an explanatory counter** after the two controlled runs specified in the catalog.
+- One qualifying primary regression without corroboration produces `HOLD` and an immediate targeted retest, not `CONTINUE`.
+- `WORKLOAD_SLO_BREACH` halts independently under the workload's approved absolute policy, even if controls also breach it.
 - GPU utilization dropping by itself, temperature increasing within normal limits, or a lifetime error count remaining nonzero does not stop deployment.
 
 Do not use arbitrary "two bad metrics" logic: temperature and thermal throttling can be two views of the same cause. Require an impact measure plus a relevant explanatory signal, or repeated independent end-to-end evidence.
+
+Decision precedence is `HALT > HOLD > CONTINUE`: any critical signal `FAIL` halts; otherwise required `UNKNOWN`, incomplete validation, or an unconfirmed primary regression holds; otherwise all required gates, tests and soak must pass before continuing. Supporting `WARN` alone is advisory, never an independent halt. A latched halt remains in force until audited resolution.
 
 ### 6.3 Freshness and evidence gates
 
@@ -483,7 +547,25 @@ This is a proposed envelope, not an existing client API. The sample identifier a
 
 The evaluator derives a **new error** only if it has a valid preceding sample in the same counter epoch, or an authoritative new-error event. A first-seen cumulative value of `1` does not prove a new post-update error. Missing prior evidence holds the relevant gate until reconciled.
 
-An emitted decision should contain at least:
+The resulting **health signal** is separate from the raw metric above. For example, after confirming the positive delta:
+
+```json
+{
+  "kind": "health.signal",
+  "signal_id": "GPU_UNCORRECTABLE_MEMORY_ERROR",
+  "definition_version": 1,
+  "state": "FAIL",
+  "entity": {"type": "gpu", "id": "GPU-example-uuid"},
+  "deployment_id": "deploy-042",
+  "window_start": "2026-11-15T06:59:55Z",
+  "window_end": "2026-11-15T07:00:00Z",
+  "policy_version": "gpu-gate-v1",
+  "evidence_ids": ["observation-before", "observation-after"],
+  "reason": "Uncorrectable error counter increased by 1 within gpu-reset-2"
+}
+```
+
+An emitted deployment decision references the catalog signal and its evidence:
 
 ```json
 {
@@ -496,7 +578,8 @@ An emitted decision should contain at least:
     "id": "canary"
   },
   "affected_entities": ["node-017"],
-  "reason_code": "GPU_NEW_UNCORRECTABLE_MEMORY_ERROR",
+  "signal_id": "GPU_UNCORRECTABLE_MEMORY_ERROR",
+  "reason_code": "NEW_UNCORRECTABLE_ERROR",
   "policy_version": "gpu-gate-v1",
   "baseline_id": "baseline-042",
   "evidence_ids": ["observation-before", "observation-after"],
@@ -555,6 +638,9 @@ Tests need explicit duration, timeout, resource ownership, retry, and cleanup bu
 | New verified uncorrectable GPU error during canary | Immediate hard gate; fence acknowledged within the measured critical-event target |
 | GPU utilization falls because there is no queued work | No false hardware failure; performance remains unvalidated until eligible work exists |
 | 12% matched compute regression with sustained abnormal throttling for three eligible windows | Soft halt if candidate-local and beyond the baseline noise envelope |
+| `GPU_COMPUTE_REGRESSION` primary impact >10% with no supporting warning and no repeated severe-regression result | `WARN -> HOLD` for controlled retest; do not silently continue |
+| `GPU_MEMORY_WARNING` has only an ECC-rate reason, with no compute/HBM impact or independent vendor warning | Supporting warning only; it cannot corroborate itself into `GPU_MEMORY_DETERIORATION` failure |
+| `GPU_HBM_BANDWIDTH_REGRESSION` impact exceeds 10% with `GPU_CLOCK_ABNORMAL` for three eligible windows | Halt even if a compute-only probe still passes |
 | 25% reproducible collective throughput loss with clean error counters | Halt after two independent controlled runs against stable controls |
 | Shared switch/storage problem affects controls and candidate nodes | Hold affected rollout; create shared-infrastructure incident rather than claim update causality |
 | Host/collector reboots and ECC counter restarts | No negative-rate artifact; epoch transition tracked and missing evidence explicitly gated |
